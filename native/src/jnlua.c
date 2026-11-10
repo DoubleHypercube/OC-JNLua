@@ -238,7 +238,8 @@ static jobject getjavastate(lua_State* L) {
 	return obj;
 }
 /* This default allocator is set while inside the controlled allocator to
-   avoid recursion when looking up the Java state from the Lua state. */
+   avoid recursion when looking up the Java state from the Lua state (Lua 5.2
+   and 5.3 only, see below). */
 static void* l_alloc_unchecked (void *ud, void *ptr, size_t osize, size_t nsize) {
 	if (nsize == 0) {
 		free(ptr);
@@ -247,14 +248,37 @@ static void* l_alloc_unchecked (void *ud, void *ptr, size_t osize, size_t nsize)
 		return realloc(ptr, nsize);
 	}
 }
-/* This custom allocator ensures a VM won't exceed its allowed memory use. */
-static void* l_alloc_checked (void *ud, void *ptr, size_t osize, size_t nsize) {
-	JNIEnv *thread_env = getthreadenv();
-	lua_State *L = (lua_State*)ud;
+/*
+ * Java state lookup for the allocator.
+ * Fixes PC-Logix/OpenComputers#142
+ */
+static void* l_alloc_checked (void *ud, void *ptr, size_t osize, size_t nsize);
+#if LUA_VERSION_NUM >= 504
+#define ALLOC_JAVASTATE(L) (*(jobject *) lua_getextraspace(L))
+static jobject alloc_getjavastate (lua_State *L) {
+	return ALLOC_JAVASTATE(L);
+}
+static void alloc_setjavastate (lua_State *L, jobject obj) {
+	ALLOC_JAVASTATE(L) = obj;
+}
+#else
+static jobject alloc_getjavastate (lua_State *L) {
 	jobject obj;
 	lua_setallocf(L, l_alloc_unchecked, NULL);
 	obj = getjavastate(L);
 	lua_setallocf(L, l_alloc_checked, L);
+	return obj;
+}
+static void alloc_setjavastate (lua_State *L, jobject obj) {
+	(void) L;
+	(void) obj;
+}
+#endif
+/* This custom allocator ensures a VM won't exceed its allowed memory use. */
+static void* l_alloc_checked (void *ud, void *ptr, size_t osize, size_t nsize) {
+	JNIEnv *thread_env = getthreadenv();
+	lua_State *L = (lua_State*)ud;
+	jobject obj = alloc_getjavastate(L);
 	if (obj) {
 		/* We have a Java state, enforce memory control. */
 		jint total = 0, used = 0;
@@ -292,6 +316,8 @@ static lua_State *controlled_newstate (JNIEnv *env, jobject obj) {
 		jint total = 0, used = 0;
 		getluamemory(env, obj, &total, &used);
 		if (total > 0) {
+		    /* We need to explicitly zero this */
+			alloc_setjavastate(L, NULL);
 			lua_setallocf(L, l_alloc_checked, L);
 		}
 	}
@@ -331,6 +357,11 @@ JNIEXPORT void JNICALL JNI_LUASTATE_METHOD(lua_1newstate) (JNIEnv *env, jobject 
 		return;
 	}
 	
+	/* Cache the Java state for the allocator (only for states we created). */
+	if (!existing) {
+		alloc_setjavastate(L, getjavastate(L));
+	}
+	
 	/* Set the Lua state in the Java state. */
 	setluathread(env, obj, L);
 	setluastate(env, obj, L);
@@ -338,6 +369,17 @@ JNIEXPORT void JNICALL JNI_LUASTATE_METHOD(lua_1newstate) (JNIEnv *env, jobject 
 
 /* lua_close() */
 static int close_protected (lua_State *L) {
+#if LUA_VERSION_NUM >= 504
+	/* tear down the allocator state */
+	lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+	{
+		lua_State *M = lua_tothread(L, -1);
+		if (M) {
+			alloc_setjavastate(M, NULL);
+		}
+	}
+	lua_pop(L, 1);
+#endif
 	/* Unset the Java state in the Lua state. */
 	lua_pushnil(L);
 	lua_setfield(L, LUA_REGISTRYINDEX, JNLUA_JAVASTATE);
@@ -359,6 +401,7 @@ JNIEXPORT void JNICALL JNI_LUASTATE_METHOD(lua_1close) (JNIEnv *env, jobject obj
 		setluathread(env, obj, NULL);
 		
 		/* Close Lua state. */
+		alloc_setjavastate(L, NULL);
 		lua_setallocf(L, l_alloc_unchecked, NULL);
 		setluamemory(env, obj, 0);
 		lua_close(L);

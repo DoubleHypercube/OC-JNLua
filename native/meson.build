@@ -136,6 +136,10 @@ endif
 jnlua_sources += ['src/liolib_none.c']
 jnlua_sources += ['src/loadlib_none.c']
 
+# see xkcd 927
+add_project_arguments('-std=gnu99', language: 'c')
+add_project_arguments('-Wno-error=incompatible-pointer-types', language: 'c')
+
 add_project_arguments('-fno-strict-aliasing', language: 'c')
 add_project_arguments('-D_REENTRANT', language: 'c')
 if host_machine.system() == 'linux'
@@ -153,9 +157,26 @@ endif
 
 lib_suffix = '-' + host_machine.system() + '-' + host_machine.cpu_family()
 
+fs = import('fs')
 math_dep = compiler.find_library('m', required: true)
 if get_option('use_local_jni')
-	jni_dep = dependency('jni', version: '>= 1.8.0', modules: ['jvm'], required: true)
+	# try JAVA_HOME first then locate
+	java_home = run_command('sh', '-c',
+		'if [ -n "$JAVA_HOME" ]; then printf %s "$JAVA_HOME"; ' +
+		'elif command -v javac >/dev/null 2>&1; then ' +
+		'dirname "$(dirname "$(readlink -f "$(command -v javac)")")"; fi',
+		check: false).stdout().strip()
+	if java_home == '' or not fs.exists(java_home / 'include' / 'jni.h')
+		error('Could not locate a JDK. Try setting JAVA_HOME?')
+	endif
+	jni_dep = declare_dependency(
+		link_args: ['-L' + java_home / 'lib' / 'server', '-ljvm'],
+		include_directories: include_directories(
+			java_home / 'include',
+			java_home / 'include' / host_machine.system(),
+			is_system: true
+		)
+	)
 else
 	jni_include_dir = join_paths('jni', host_machine.system(), host_machine.cpu_family(), 'include')
 	jni_lib_dir = join_paths(meson.source_root(), 'jni', host_machine.system(), host_machine.cpu_family(), 'lib')
@@ -173,17 +194,17 @@ else
 	endif
 endif
 
-native52_sources = lua52_sources
-native52_sources += jnlua_sources
-library('jnlua52' + lib_suffix, native52_sources, dependencies: [math_dep, jni_dep],
-	include_directories: include_directories('lua52/src', 'src'))
-
-native53_sources = lua53_sources
-native53_sources += jnlua_sources
-library('jnlua53' + lib_suffix, native53_sources, dependencies: [math_dep, jni_dep],
-	include_directories: include_directories('lua53/src', 'src'))
-
-native54_sources = lua54_sources
-native54_sources += jnlua_sources
-library('jnlua54' + lib_suffix, native54_sources, dependencies: [math_dep, jni_dep],
-	include_directories: include_directories('lua54/src', 'src'))
+built_any = false
+foreach v : ['52', '53', '54']
+	if fs.is_dir('lua' + v + '/src')
+		srcs = get_variable('lua' + v + '_sources') + jnlua_sources
+		library('jnlua' + v + lib_suffix, srcs, dependencies: [math_dep, jni_dep],
+			include_directories: include_directories('lua' + v + '/src', 'src'))
+		built_any = true
+	else
+		warning('lua' + v + '/src is missing, skipping jnlua' + v)
+	endif
+endforeach
+if not built_any
+	error('No lua*/src directories found; run: git submodule update --init --recursive')
+endif
